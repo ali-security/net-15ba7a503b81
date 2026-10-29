@@ -104,5 +104,36 @@ func TestIDNASeparators(t *testing.T) {
 	}
 }
 
-// TODO(nigeltao): test errors, once we've specified when ToASCII and ToUnicode
-// return errors.
+func TestIDNAErrors(t *testing.T) {
+	for _, tc := range []string{
+		"xn--example-.com",
+	} {
+		if got, err := ToASCII(tc); err == nil {
+			t.Errorf("ToASCII(%q) = %q, want error", tc, got)
+		}
+		if got, err := ToUnicode(tc); err == nil {
+			t.Errorf("ToUnicode(%q) = %q, want error", tc, got)
+		}
+	}
+}
+
+func TestIDNAErrorsASCIIPunycodeLabel(t *testing.T) {
+	// An xn-- label whose punycode decodes to a pure ASCII label must be
+	// rejected by every profile, otherwise "xn--example-.com" would be
+	// treated as an alias of "example.com".
+	for _, p := range []*Profile{Punycode, Lookup, Display, Registration} {
+		for _, tc := range []string{
+			"xn--example-",
+			"xn--example-.com",
+			"www.xn--example-.com",
+			"xn--bcher-kva.xn--example-.com",
+		} {
+			if got, err := p.ToASCII(tc); err == nil {
+				t.Errorf("%v: ToASCII(%q) = %q, want error", p, tc, got)
+			}
+			if got, err := p.ToUnicode(tc); err == nil {
+				t.Errorf("%v: ToUnicode(%q) = %q, want error", p, tc, got)
+			}
+		}
+	}
+}
