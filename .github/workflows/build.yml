@@ -1,0 +1,122 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run instead of the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MODULE: golang.org/x/net
+      VERSION: v0.45.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # go.mod declares `go 1.24.0`; Go 1.24 is the minimum toolchain the release supports.
+          go-version: "1.24"
+          cache: false
+
+      - name: Create module zip
+        run: |
+          set -euo pipefail
+          # Pack from a copy of the tree without this CI workflow, which is not part of the
+          # published module; zip.CreateFromDir applies the module proxy's own inclusion rules.
+          SRC="$RUNNER_TEMP/modsrc"
+          mkdir -p "$SRC"
+          cp -a . "$SRC/"
+          rm -rf "$SRC/.git" "$SRC/.github/workflows/build.yml"
+          find "$SRC/.github" -depth -type d -empty -delete
+          HELPER="$RUNNER_TEMP/create_mod"
+          mkdir -p "$HELPER" "$RUNNER_TEMP/build_output"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$HELPER"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MODULE" "$VERSION" "$SRC" "$RUNNER_TEMP/build_output/$VERSION.zip"
+          unzip -l "$RUNNER_TEMP/build_output/$VERSION.zip" | tail -n 1
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Configure loopback networking for tests
+        run: |
+          # The ipv6 suite needs a routable (non-::1) IPv6 address on the loopback
+          # interface (nettest.RoutedInterface ignores ::1), and icmp needs unprivileged
+          # ping sockets; GitHub runners ship with neither.
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          sudo ip -6 addr add fd00::1/128 dev lo
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          # lo stays without the MULTICAST flag (the runner default): the loopback
+          # multicast tests skip with "no available interface" / "not available on linux".
+          # Turning it on makes the ipv4 source-specific multicast subtest
+          # (232.0.1.254 from 127.0.0.1) block forever in ReadFrom on hosted runners.
+          ip addr show lo
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -o pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -count=1 -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/test.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -v -count=1 ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          fi
+
+      - name: Test summary
+        if: always()
+        run: |
+          LOG="$RUNNER_TEMP/test.log"
+          if [ -f "$LOG" ]; then
+            awk '/^ok[ \t]/{ok++} /^FAIL[ \t]/{pf++} /^[ \t]*--- PASS:/{p++} /^[ \t]*--- FAIL:/{f++} /^[ \t]*--- SKIP:/{s++}
+              END {printf "Packages ok: %d\nPackages FAIL: %d\nTests passed: %d\nTests failed: %d\nTests skipped: %d\n", ok, pf, p, f, s}' "$LOG"
+            echo "=== Skipped tests and reasons ==="
+            # go test -v prints a test's t.Skip message under its "=== RUN" line, before the
+            # "--- SKIP" result, so attribute each indented file.go:N: message to the running test.
+            awk '/^=== (RUN|CONT|NAME|PAUSE) / {cur=$3; if ($2=="RUN") msg[cur]=""; next}
+              /^[ \t]*--- SKIP: / {print $3 ":"; printf "%s", msg[$3]; next}
+              /^[ \t]+[^ \t-][^ \t]*\.go:[0-9]+: / {if (cur!="") msg[cur]=msg[cur] $0 "\n"}' "$LOG"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/build_output/*.zip
+          if-no-files-found: error
